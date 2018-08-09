@@ -1,1 +1,1 @@
-from symbolator_sphinx import *
+from .symbolator_sphinx import *

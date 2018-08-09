@@ -24,7 +24,7 @@ def get_package_version(verfile):
 version = get_package_version('symbolator.py')
 
 if version is None:
-    raise RuntimeError('Unable to find version string in file: {0}'.format(version_file))
+    raise RuntimeError('Unable to find version string')
 
 
 setup(name='symbolator',
@@ -44,8 +44,6 @@ setup(name='symbolator',
     },
     include_package_data = True,
 
-    use_2to3 = True,
-    
     keywords='HDL symbol',
     license='MIT',
     classifiers=['Development Status :: 5 - Production/Stable',
@@ -54,7 +52,6 @@ setup(name='symbolator',
         'Topic :: Multimedia :: Graphics',
         'Topic :: Software Development :: Documentation',
         'Natural Language :: English',
-        'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3',
         'License :: OSI Approved :: MIT License'
         ]
