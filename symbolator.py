@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 # Copyright © 2017 Kevin Thibedeau
 # Distributed under the terms of the MIT license
-from __future__ import print_function
 
-import sys, copy, re, argparse, os, errno
+import sys, copy, re, argparse, os, errno, pprint
 
 from nucanvas import DrawStyle, NuCanvas
 from nucanvas.cairo_backend import CairoSurface
@@ -12,12 +11,41 @@ from nucanvas.svg_backend import SvgSurface
 from nucanvas.shapes import PathShape, OvalShape
 import nucanvas.color.sinebow as sinebow
 
-import hdlparse.vhdl_parser as vhdl
-import hdlparse.verilog_parser as vlog
-
-from hdlparse.vhdl_parser import VhdlComponent
+import hdlConvertor
 
 __version__ = '1.0.2'
+
+class Parameter(object):
+  '''Parameter to subprograms, ports, and generics
+
+  Args:
+    name (str): Name of the object
+    mode (str): Direction mode for the parameter (in, out, inout)
+    data_type (str): Type name for the parameter
+    default_value (str): Default value of the parameter
+  '''
+  def __init__(self, name, mode=None, data_type=None, default_value=None):
+    self.name = name
+    self.mode = mode
+    self.data_type = data_type
+    self.default_value = default_value
+
+class Component(object):
+  '''Component declaration
+
+  Args:
+    name (str): Name of the component
+    package (str): Package containing the component
+    ports (list of Parameter): Port parameters to the component
+    generics (list of Parameter): Generic parameters to the component
+    sections (list of str): Metacomment sections
+  '''
+  def __init__(self, name, package, ports, generics=[], sections={}):
+    self.name = name
+    self.package = package
+    self.ports = ports
+    self.generics = generics
+    self.sections = sections
 
 
 def xml_escape(txt):
@@ -284,9 +312,7 @@ class HdlSymbol(object):
 
       yoff += bb[3] - bb[1] + self.symbol_spacing
 
-
-
-def make_section(sname, sect_pins, fill, extractor, no_type=False):
+def make_section(sname, sect_pins, fill, no_type=False):
   '''Create a section from a pin list'''
   sect = PinSection(sname, fill=fill)
   side = 'l'
@@ -295,7 +321,7 @@ def make_section(sname, sect_pins, fill, extractor, no_type=False):
     pname = p.name
     pdir = p.mode
     data_type = p.data_type if no_type == False else None
-    bus = extractor.is_array(p.data_type)
+    bus = '[' in p.data_type
 
     pdir = pdir.lower()
 
@@ -335,14 +361,14 @@ def make_section(sname, sect_pins, fill, extractor, no_type=False):
 
   return sect
 
-def make_symbol(comp, extractor, title=False, no_type=False):
+def make_symbol(comp, title=False, no_type=False):
   '''Create a symbol from a parsed component/module'''
   vsym = HdlSymbol() if title == False else HdlSymbol(comp.name)
 
   color_seq = sinebow.distinct_color_sequence(0.6)
 
   if len(comp.generics) > 0: #'generic' in entity_data:
-    s = make_section(None, comp.generics, (200,200,200), extractor, no_type)
+    s = make_section(None, comp.generics, (200,200,200), no_type)
     s.line_color = (100,100,100)
     gsym = Symbol([s], line_color=(100,100,100))
     vsym.add_symbol(gsym)
@@ -364,7 +390,7 @@ def make_symbol(comp, extractor, title=False, no_type=False):
       sections.append((sect_name, cur_sect))
 
     for sdata in sections:
-      s = make_section(sdata[0], sdata[1], sinebow.lighten(next(color_seq), 0.75), extractor, no_type)
+      s = make_section(sdata[0], sdata[1], sinebow.lighten(next(color_seq), 0.75), no_type)
       psym.add_section(s)
 
     vsym.add_symbol(psym)
@@ -374,12 +400,9 @@ def make_symbol(comp, extractor, title=False, no_type=False):
 def parse_args():
   '''Parse command line arguments'''
   parser = argparse.ArgumentParser(description='HDL symbol generator')
-  parser.add_argument('-i', '--input', dest='input', action='store', help='HDL source ("-" for STDIN)')
+  parser.add_argument('-i', '--input', dest='input', action='store', help='HDL source file')
   parser.add_argument('-o', '--output', dest='output', action='store', help='Output file')
   parser.add_argument('-f', '--format', dest='format', action='store', default='svg', help='Output format')
-  parser.add_argument('-L', '--library', dest='lib_dirs', action='append',
-    default=['.'], help='Library path')
-  parser.add_argument('-s', '--save-lib', dest='save_lib', action='store', help='Save type def cache file')
   parser.add_argument('-t', '--transparent', dest='transparent', action='store_true',
     default=False, help='Transparent background')
   parser.add_argument('--scale', dest='scale', action='store', default='1', help='Scale image')
@@ -400,22 +423,9 @@ def parse_args():
   if args.format.lower() in ('png', 'svg', 'pdf', 'ps', 'eps'):
     args.format = args.format.lower()
 
-  if args.input == '-' and args.output is None: # Reading from stdin: must have full output file name
-    print('Error: output file is required')
-    sys.exit(1)
-
   args.scale = float(args.scale)
 
-  # Remove duplicates
-  args.lib_dirs = list(set(args.lib_dirs))
-
   return args
-
-
-def is_verilog_code(code):
-  '''Identify Verilog from stdin'''
-  return re.search('endmodule', code) is not None
-
 
 def file_search(base_dir, extensions=('.vhdl', '.vhd')):
   '''Recursively search for files with matching extensions'''
@@ -428,19 +438,13 @@ def file_search(base_dir, extensions=('.vhdl', '.vhd')):
 
   return hdl_files
 
-def create_directories(fname):
-  '''Create all parent directories in a file path'''
-  try:
-    os.makedirs(os.path.dirname(fname))
-  except OSError as e:
-    if e.errno != errno.EEXIST and e.errno != errno.ENOENT:
-      raise
-
 def reformat_array_params(vo):
   '''Convert array ranges to Verilog style'''
   for p in vo.ports:
+    if p.data_type is None:
+      continue
     # Replace VHDL downto and to
-    data_type = p.data_type.replace(' downto ', ':').replace(' to ', u'\u2799')
+    data_type = p.data_type.replace(' downto ', ':').replace(' to ', '\u2799')
     # Convert to Verilog style array syntax
     data_type = re.sub(r'([^(]+)\((.*)\)$', r'\1[\2]', data_type)
 
@@ -452,6 +456,61 @@ def reformat_array_params(vo):
 
     p.data_type = data_type
 
+def get_type_str(type_dict):
+  if 'literal' in type_dict and type_dict['literal']['type'] == 'ID':
+    return type_dict['literal']['value']
+  if 'literal' in type_dict and type_dict['literal']['type'] == 'INT':
+    return str(type_dict['literal']['value'])
+  if 'binOperator' in type_dict and type_dict['binOperator']['operator'] == 'INDEX':
+    base = get_type_str(type_dict['binOperator']['op0'])
+    index = get_type_str(type_dict['binOperator']['op1'])
+    return "{}({})".format(base, index)
+  if 'binOperator' in type_dict and type_dict['binOperator']['operator'] == 'CALL':
+      base = get_type_str(type_dict['binOperator']['op0'])
+      operands = [get_type_str(op) for op in type_dict['binOperator']['operands']]
+      return "{}({})".format(base, ", ".join(operands))
+
+  binaryOps = {'DOWNTO': 'downto',
+               'TO': 'to',
+               'ADD': '+',
+               'SUB': '-',
+               'DIV': '/',
+               'MUL': '*',
+               'POW': '**'
+  }
+  if 'binOperator' in type_dict and type_dict['binOperator']['operator'] in binaryOps:
+    left = get_type_str(type_dict['binOperator']['op0'])
+    right = get_type_str(type_dict['binOperator']['op1'])
+    return "{} {} {}".format(left, binaryOps[type_dict['binOperator']['operator']], right)
+
+  print("Unknown type encountered:")
+  pprint.pprint(type_dict)
+  return ""
+
+def process_file(filename, language=None):
+  extension = os.path.splitext(filename)[1].lower()
+  if language is None and extension in ('.vhdl', '.vhd'):
+    language = "vhdl"
+  elif language is None and extension in ('.v'):
+    language = "verilog"
+  elif language is None and extension in ('.sv'):
+    language = "system_verilog"
+
+  if language is None:
+    return []
+
+  components = []
+  p = hdlConvertor.parse(filename, language)
+  for entity in p['entities']:
+    ports = []
+    generics = []
+    for port in entity['ports']:
+      ports.append(Parameter(port['variable']['name'], port['direction'], get_type_str(port['variable']['type'])))
+    for generic in entity['generics']:
+      generics.append(Parameter(generic['name'], 'in', get_type_str(generic['type'])))
+    components.append(Component(entity['name'], None, ports, generics))
+  return components
+
 def main():
   '''Run symbolator'''
   args = parse_args()
@@ -459,69 +518,18 @@ def main():
   style = DrawStyle()
   style.line_color = (0,0,0)
 
-  vhdl_ex = vhdl.VhdlExtractor()
-  vlog_ex = vlog.VerilogExtractor()
-
-  if os.path.isfile(args.lib_dirs[0]):
-    # This is a file containing previously parsed array type names
-    vhdl_ex.load_array_types(args.lib_dirs[0])
-
-  else: # args.lib_dirs is a path
-    # Find all library files
-    flist = []
-    for lib in args.lib_dirs:
-      print('Scanning library:', lib)
-      flist.extend(file_search(lib, extensions=('.vhdl', '.vhd', '.vlog', '.v'))) # Get VHDL and Verilog files
-    if args.input and os.path.isfile(args.input):
-      flist.append(args.input)
-
-    # Find all of the array types
-    vhdl_ex.register_array_types_from_sources(flist)
-
-    #print('## ARRAYS:', vhdl_ex.array_types)
-
-  if args.save_lib:
-    print('Saving type defs to "{}".'.format(args.save_lib))
-    vhdl_ex.save_array_types(args.save_lib)
-
-
-  if args.input is None:
-    sys.exit(0)
-
-  if args.input == '-': # Read from stdin
-    code = ''.join(list(sys.stdin))
-    if is_verilog_code(code):
-      all_components = {'<stdin>': [(c, vlog_ex) for c in vlog_ex.extract_objects_from_source(code)]}
-    else:
-      all_components = {'<stdin>': [(c, vhdl_ex) for c in vhdl_ex.extract_objects_from_source(code, VhdlComponent)]}
-    # Output is a named file
-
-  elif os.path.isfile(args.input):
-    if vhdl.is_vhdl(args.input):
-      all_components = {args.input: [(c, vhdl_ex) for c in vhdl_ex.extract_objects(args.input, VhdlComponent)]}
-    else:
-      all_components = {args.input: [(c, vlog_ex) for c in vlog_ex.extract_objects(args.input)]}
-    # Output is a directory
-
+  if os.path.isfile(args.input):
+    flist = [args.input]
   elif os.path.isdir(args.input):
     flist = set(file_search(args.input, extensions=('.vhdl', '.vhd', '.vlog', '.v')))
-
-    # Separate file by extension
-    vhdl_files = set(f for f in flist if vhdl.is_vhdl(f))
-    vlog_files = flist - vhdl_files
-
-    all_components = {f: [(c, vhdl_ex) for c in vhdl_ex.extract_objects(f, VhdlComponent)] for f in vhdl_files}
-
-    vlog_components = {f: [(c, vlog_ex) for c in vlog_ex.extract_objects(f)] for f in vlog_files}
-    all_components.update(vlog_components)
-    # Output is a directory
-
   else:
     print('ERROR: Invalid input source')
     sys.exit(1)
 
+  all_components = {f: process_file(f) for f in flist}
+
   if args.output:
-    create_directories(args.output)
+    os.makedirs(args.output, exist_ok=True)
 
   nc = NuCanvas(None)
 
@@ -543,12 +551,13 @@ def main():
     (0,0), 'auto', None)
 
   # Render every component from every file into an image
-  for source, components in all_components.iteritems():
-    for comp, extractor in components:
+  for source, components in all_components.items():
+    for comp in components:
       reformat_array_params(comp)
       if source == '<stdin>':
         fname = args.output
       else:
+        print(source)
         base = os.path.splitext(os.path.basename(source))[0]
         fname = '{}-{}.{}'.format(base, comp.name, args.format)
         if args.output:
@@ -562,11 +571,10 @@ def main():
       nc.set_surface(surf)
       nc.clear_shapes()
 
-      sym = make_symbol(comp, extractor, args.title, args.no_type)
+      sym = make_symbol(comp, args.title, args.no_type)
       sym.draw(0,0, nc)
 
       nc.render()
 
 if __name__ == '__main__':
   main()
-
